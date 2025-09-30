@@ -15,15 +15,15 @@ Thumbs.db
 # Reports & artifacts
 reports/
 
-# Data: ignore all except the two small CSVs the API needs
+# Data: ignore all; we'll only commit tiny header-only CSVs
 data/*
 !data/flight_cancel_features.csv
 !data/flight_features.csv
 
-# Models: ignore all except lightweight feature-order CSVs
+# Models: only keep feature-order CSVs, never .pkl
 model/*
 !model/delay_feature_order_fixed.csv
 !model/cancel_feature_order_fixed.csv
 
-# Ignore large binary model files (.pkl) always
+# Never track model binaries
 *.pkl
