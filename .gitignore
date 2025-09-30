@@ -1,0 +1,29 @@
+# Bytecode / cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Reports & artifacts
+reports/
+
+# Data: ignore all except the two small CSVs the API needs
+data/*
+!data/flight_cancel_features.csv
+!data/flight_features.csv
+
+# Models: ignore all except lightweight feature-order CSVs
+model/*
+!model/delay_feature_order_fixed.csv
+!model/cancel_feature_order_fixed.csv
+
+# Ignore large binary model files (.pkl) always
+*.pkl
