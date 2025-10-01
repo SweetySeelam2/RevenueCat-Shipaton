@@ -1,23 +1,27 @@
-import os
-import requests
+# fetch_models.py
+import os, pathlib, urllib.request
 
-# URLs from Hugging Face Hub
-CANCEL_URL = os.getenv("CANCEL_MODEL_URL")
-DELAY_URL = os.getenv("DELAY_MODEL_URL")
+CANCEL_URL = os.getenv("MODEL_URL")            # remote .pkl for cancellation
+DELAY_URL  = os.getenv("MODEL_DELAY_URL")      # remote .pkl for delay
 
-os.makedirs("model", exist_ok=True)
+CANCEL_PATH = os.getenv("MODEL_PATH", "model/rf_cancel_model_fixed.pkl")
+DELAY_PATH  = os.getenv("MODEL_DELAY_PATH", "model/rf_delay_model_fixed.pkl")
 
-def download(url, out_path):
-    if not url:
-        print(f"⚠️ Skipping {out_path}, no URL provided")
+def _download(url: str, out_path: str):
+    if not url: 
         return
-    print(f"⬇️ Downloading {url} → {out_path}")
-    r = requests.get(url, stream=True)
-    r.raise_for_status()
-    with open(out_path, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-    print(f"✅ Saved {out_path}")
+    pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    print(f"[fetch_models] downloading {url} -> {out_path} …")
+    urllib.request.urlretrieve(url, out_path)
+    print(f"[fetch_models] saved {out_path} ({os.path.getsize(out_path)} bytes)")
 
-download(CANCEL_URL, "model/rf_cancel_model_fixed.pkl")
-download(DELAY_URL, "model/rf_delay_model_fixed.pkl")
+# Only download if the file is missing
+if not os.path.exists(CANCEL_PATH):
+    _download(CANCEL_URL, CANCEL_PATH)
+else:
+    print(f"[fetch_models] found {CANCEL_PATH}, skipping")
+
+if not os.path.exists(DELAY_PATH):
+    _download(DELAY_URL, DELAY_PATH)
+else:
+    print(f"[fetch_models] found {DELAY_PATH}, skipping")
