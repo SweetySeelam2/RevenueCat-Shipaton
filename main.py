@@ -1,3 +1,26 @@
+# =========================
+# Bootstrap: fetch models if missing (downloads from URLs in env)
+# =========================
+import os
+
+CANCEL_PKL = "model/rf_cancel_model_fixed.pkl"
+DELAY_PKL  = "model/rf_delay_model_fixed.pkl"
+
+# Only import fetcher (which performs the download) if any model file is missing
+if not (os.path.exists(CANCEL_PKL) and os.path.exists(DELAY_PKL)):
+    try:
+        import fetch_models  # runs on import; uses CANCEL_MODEL_URL / DELAY_MODEL_URL env vars
+        # Re-check after fetch_models ran
+        if not os.path.exists(CANCEL_PKL):
+            print(f"⚠️ Warning: {CANCEL_PKL} still not present after fetch_models.")
+        if not os.path.exists(DELAY_PKL):
+            print(f"⚠️ Warning: {DELAY_PKL} still not present after fetch_models.")
+    except Exception as _e:
+        print(f"⚠️ fetch_models import failed: {_e}")
+
+# =========================
+# Main API
+# =========================
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Optional
@@ -5,18 +28,17 @@ import pandas as pd
 import joblib
 import shap
 import numpy as np
-import os
 
 # =========================
 # Paths (env-overridable)
 # =========================
 # Cancellation
-MODEL_PATH = os.getenv("MODEL_PATH", "model/rf_cancel_model_fixed.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", CANCEL_PKL)
 FEATURES_SAMPLE_PATH = os.getenv("FEATURES_SAMPLE_PATH", "data/flight_cancel_features.csv")
 CANCEL_FEATURE_ORDER_CSV = os.getenv("CANCEL_FEATURE_ORDER_CSV", "model/cancel_feature_order_fixed.csv")
 
 # Delay (LEAKAGE-FREE)
-MODEL_DELAY_PATH = os.getenv("MODEL_DELAY_PATH", "model/rf_delay_model_fixed.pkl")
+MODEL_DELAY_PATH = os.getenv("MODEL_DELAY_PATH", DELAY_PKL)
 DELAY_FEATURES_SAMPLE_PATH = os.getenv("DELAY_FEATURES_SAMPLE_PATH", "data/flight_features.csv")
 DELAY_FEATURE_ORDER_CSV = os.getenv("DELAY_FEATURE_ORDER_CSV", "model/delay_feature_order_fixed.csv")
 
@@ -120,7 +142,7 @@ class FlightFeatures(BaseModel):
 # =========================
 app = FastAPI(
     title="CancelSense API",
-    version="1.3.0",
+    version="1.3.1",
     description="Predict flight cancellation & delay risk with explanations (leakage-free delay)."
 )
 
@@ -132,6 +154,8 @@ def health():
         "delay_features_count": len(delay_feature_names),
         "cancel_model_path": MODEL_PATH,
         "delay_model_path": MODEL_DELAY_PATH,
+        "cancel_model_present": file_exists(MODEL_PATH),
+        "delay_model_present": file_exists(MODEL_DELAY_PATH),
         "delay_model_loaded": rf_delay is not None
     }
 
