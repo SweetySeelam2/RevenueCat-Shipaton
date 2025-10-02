@@ -1,0 +1,13 @@
+name: keepalive
+
+on:
+  schedule: [{ cron: "*/10 * * * *" }]
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit health
+        run: |
+          curl -sS --max-time 20 https://revenuecat-shipaton-production.up.railway.app/health || true
