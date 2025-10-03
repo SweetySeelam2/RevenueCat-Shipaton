@@ -9,12 +9,14 @@ import pandas as pd
 import numpy as np
 import joblib
 
-# If models are missing, fetch them (fetcher uses MODEL_URL / MODEL_DELAY_URL)
-if not (os.path.exists("model/rf_cancel_model_fixed.pkl") and os.path.exists("model/rf_delay_model_fixed.pkl")):
-    try:
-        import fetch_models  # runs on import
-    except Exception as e:
-        print(f"[startup] fetch_models failed (will still try lazy loads): {e}")
+# =========================
+# Early: ensure models exist (startup self-heal)
+# =========================
+try:
+    from fetch_models import ensure_models
+    ensure_models()
+except Exception as e:
+    print(f"[startup] ensure_models warning: {e}")
 
 # =========================
 # Env / paths
@@ -22,8 +24,12 @@ if not (os.path.exists("model/rf_cancel_model_fixed.pkl") and os.path.exists("mo
 MODEL_PATH = os.getenv("MODEL_PATH", "model/rf_cancel_model_fixed.pkl")
 MODEL_DELAY_PATH = os.getenv("MODEL_DELAY_PATH", "model/rf_delay_model_fixed.pkl")
 
-CANCEL_FEATURE_ORDER_CSV = os.getenv("CANCEL_FEATURE_ORDER_CSV", "model/cancel_feature_order_fixed.csv")
-DELAY_FEATURE_ORDER_CSV = os.getenv("DELAY_FEATURE_ORDER_CSV", "model/delay_feature_order_fixed.csv")
+CANCEL_FEATURE_ORDER_CSV = os.getenv(
+    "CANCEL_FEATURE_ORDER_CSV", "model/cancel_feature_order_fixed.csv"
+)
+DELAY_FEATURE_ORDER_CSV = os.getenv(
+    "DELAY_FEATURE_ORDER_CSV", "model/delay_feature_order_fixed.csv"
+)
 
 # =========================
 # Globals (lazy cache)
@@ -39,11 +45,32 @@ _features_lock = threading.Lock()
 _model_lock = threading.Lock()
 _shap_lock = threading.Lock()
 
+# =========================
+# Helpers
+# =========================
 def _file_exists(path: str) -> bool:
     try:
         return os.path.isfile(path)
     except Exception:
         return False
+
+def ensure_cancel_ready():
+    """If the cancel model file is missing, try to download it now."""
+    if not _file_exists(MODEL_PATH):
+        try:
+            from fetch_models import ensure_models
+            ensure_models()
+        except Exception as e:
+            print(f"[lazy] ensure_cancel_ready failed: {e}")
+
+def ensure_delay_ready():
+    """If the delay model file is missing, try to download it now."""
+    if not _file_exists(MODEL_DELAY_PATH):
+        try:
+            from fetch_models import ensure_models
+            ensure_models()
+        except Exception as e:
+            print(f"[lazy] ensure_delay_ready failed: {e}")
 
 def _load_feature_names_from_csv(one_col_csv_path: str) -> List[str]:
     if not _file_exists(one_col_csv_path):
@@ -71,21 +98,25 @@ def get_delay_features() -> List[str]:
     return _delay_features
 
 def get_cancel_model():
+    """Lazy-load cancel model, self-healing if file is missing."""
     global _cancel_model
     if _cancel_model is not None:
         return _cancel_model
     with _model_lock:
         if _cancel_model is None:
+            ensure_cancel_ready()
             print("[lazy] loading cancel model …")
             _cancel_model = joblib.load(MODEL_PATH)
     return _cancel_model
 
 def get_delay_model():
+    """Lazy-load delay model, self-healing if file is missing."""
     global _delay_model
     if _delay_model is not None:
         return _delay_model
     with _model_lock:
         if _delay_model is None:
+            ensure_delay_ready()
             print("[lazy] loading delay model …")
             _delay_model = joblib.load(MODEL_DELAY_PATH)
     return _delay_model
@@ -121,8 +152,8 @@ def _as_row(payload: Dict[str, Any], columns: List[str]) -> pd.DataFrame:
 # =========================
 app = FastAPI(
     title="CancelSense API",
-    version="1.4.0",
-    description="Predict flight cancellation & delay risk with lazy-loaded models and explanations."
+    version="1.5.0",
+    description="Predict flight cancellation & delay risk with lazy-loaded, self-healing models and SHAP explanations."
 )
 
 # Simple root to confirm app is alive fast
@@ -138,12 +169,18 @@ def health():
         "delay_model_path": MODEL_DELAY_PATH,
         "cancel_features_count": len(_cancel_features) or None,
         "delay_features_count": len(_delay_features) or None,
+        # Show both in-memory and on-disk status to diagnose issues quickly
         "cancel_model_loaded": _cancel_model is not None,
         "delay_model_loaded": _delay_model is not None,
+        "cancel_model_file_exists": _file_exists(MODEL_PATH),
+        "delay_model_file_exists": _file_exists(MODEL_DELAY_PATH),
         "shap_cancel_ready": _explainer_cancel is not None,
         "shap_delay_ready": _explainer_delay is not None,
     }
 
+# =========================
+# Schemas
+# =========================
 class FlightFeatures(BaseModel):
     DOT_CODE: int
     FL_NUMBER: int
@@ -161,6 +198,9 @@ class FlightFeatures(BaseModel):
     NIGHT_FLIGHT: int
     LONG_AIR_TIME: Optional[int] = 0
 
+# =========================
+# Endpoints
+# =========================
 @app.post("/predict")
 def predict(f: FlightFeatures):
     model = get_cancel_model()
@@ -187,7 +227,11 @@ def explain(f: FlightFeatures, topk: int = 8):
         "base_value": base_value,
         "cancel_probability": float(model.predict_proba(X)[0, 1]),
         "top_contributions": [
-            {"feature": name, "shap_value": float(val), "value": float(X.iloc[0][name]) if np.issubdtype(type(X.iloc[0][name]), np.number) else X.iloc[0][name]}
+            {
+                "feature": name,
+                "shap_value": float(val),
+                "value": float(X.iloc[0][name]) if np.issubdtype(type(X.iloc[0][name]), np.number) else X.iloc[0][name],
+            }
             for name, val in contrib
         ],
     }
@@ -218,12 +262,18 @@ def explain_delay(f: FlightFeatures, topk: int = 8):
         "base_value": base_value,
         "delay_probability": float(model.predict_proba(X)[0, 1]),
         "top_contributions": [
-            {"feature": name, "shap_value": float(val), "value": float(X.iloc[0][name]) if np.issubdtype(type(X.iloc[0][name]), np.number) else X.iloc[0][name]}
+            {
+                "feature": name,
+                "shap_value": float(val),
+                "value": float(X.iloc[0][name]) if np.issubdtype(type(X.iloc[0][name]), np.number) else X.iloc[0][name],
+            }
             for name, val in contrib
         ],
     }
 
-# Optional: warm up in background AFTER the server is already up
+# =========================
+# Background warm-up
+# =========================
 def _background_warm():
     try:
         get_cancel_features()
@@ -237,4 +287,5 @@ def _background_warm():
 
 @app.on_event("startup")
 def on_startup():
+    # Kick off background warmup after the server is listening
     threading.Thread(target=_background_warm, daemon=True).start()
