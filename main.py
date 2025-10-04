@@ -1,9 +1,10 @@
 # main.py
 import os
 import threading
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
@@ -97,15 +98,28 @@ def get_delay_model():
 
 def _build_tree_explainer(model, which: str):
     """
-    Build a TreeExplainer with safer settings to reduce numba/JIT issues.
+    Build a TreeExplainer with safer settings to avoid the tree_path_dependent/raw constraint.
+    Uses a tiny background (zeros) to force the interventional path and returns probability outputs.
     """
     global _shap_cancel_error, _shap_delay_error
     import shap
     try:
-        # `check_additivity=False` avoids some additivity checks that can be brittle on versions.
-        # `model_output="probability"` makes outputs match predict_proba.
-        expl = shap.TreeExplainer(model, feature_perturbation="interventional",
-                                  model_output="probability", check_additivity=False)
+        # Build a tiny background vector from current feature list
+        if which == "cancel":
+            feats = get_cancel_features()
+        else:
+            feats = get_delay_features()
+
+        # zeros background is fine (we don't have training medians here)
+        bg = np.zeros((1, len(feats)), dtype=float)
+
+        expl = shap.TreeExplainer(
+            model,
+            data=bg,                               # forces interventional path
+            feature_perturbation="interventional",
+            model_output="probability",
+            check_additivity=False,
+        )
         return expl, None
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
@@ -122,7 +136,7 @@ def get_cancel_explainer():
     with _shap_lock:
         if _explainer_cancel is None:
             print("[lazy] building SHAP explainer (cancel) …")
-            expl, err = _build_tree_explainer(get_cancel_model(), "cancel")
+            expl, _err = _build_tree_explainer(get_cancel_model(), "cancel")
             _explainer_cancel = expl
     return _explainer_cancel
 
@@ -133,7 +147,7 @@ def get_delay_explainer():
     with _shap_lock:
         if _explainer_delay is None:
             print("[lazy] building SHAP explainer (delay) …")
-            expl, err = _build_tree_explainer(get_delay_model(), "delay")
+            expl, _err = _build_tree_explainer(get_delay_model(), "delay")
             _explainer_delay = expl
     return _explainer_delay
 
@@ -157,8 +171,17 @@ def _safe_topk_contrib(names: List[str], values: np.ndarray, Xrow: pd.Series, to
 # ============== API ==============
 app = FastAPI(
     title="CancelSense API",
-    version="1.5.0",
+    version="1.6.0",
     description="Predict flight cancellation & delay risk with robust explanations (fallbacks if SHAP fails)."
+)
+
+# ---- CORS (allow browser clients) ----
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/")
@@ -308,7 +331,7 @@ def explain_safe(f: FlightFeatures, topk: int = 8):
                 "cancel_probability": float(model.predict_proba(X)[0, 1]),
                 "top_contributions": top
             }
-    except Exception as e:
+    except Exception:
         pass  # fall through to importances
 
     # fallback to feature_importances
@@ -334,7 +357,7 @@ def explain_delay_safe(f: FlightFeatures, topk: int = 8):
                 "delay_probability": float(model.predict_proba(X)[0, 1]),
                 "top_contributions": top
             }
-    except Exception as e:
+    except Exception:
         pass
 
     return _fallback_importances(model, feats, X.iloc[0], topk)
