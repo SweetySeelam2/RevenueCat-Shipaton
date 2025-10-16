@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 import joblib
 
+print(f"[startup] PORT={os.getenv('PORT')}")
+
 # -------------------------
 # NumPy 2.x compatibility shim (old libs may reference np.bool/np.int/np.float)
 # -------------------------
