@@ -4,11 +4,23 @@ import threading
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 import joblib
+
+# -------------------------
+# NumPy 2.x compatibility shim (for older libs like SHAP that reference np.bool / np.int / np.float)
+# -------------------------
+try:
+    if not hasattr(np, "bool"):
+        np.bool = bool  # type: ignore[attr-defined]
+    if not hasattr(np, "int"):
+        np.int = int  # type: ignore[attr-defined]
+    if not hasattr(np, "float"):
+        np.float = float  # type: ignore[attr-defined]
+except Exception as _e:
+    print(f"[startup] numpy shim warning: {_e}")
 
 # --- try to ensure models are on disk (HF download) ---
 try:
@@ -98,27 +110,17 @@ def get_delay_model():
 
 def _build_tree_explainer(model, which: str):
     """
-    Build a TreeExplainer with safer settings to avoid the tree_path_dependent/raw constraint.
-    Uses a tiny background (zeros) to force the interventional path and returns probability outputs.
+    Build a TreeExplainer with safer settings (works better across versions).
     """
     global _shap_cancel_error, _shap_delay_error
-    import shap
     try:
-        # Build a tiny background vector from current feature list
-        if which == "cancel":
-            feats = get_cancel_features()
-        else:
-            feats = get_delay_features()
-
-        # zeros background is fine (we don't have training medians here)
-        bg = np.zeros((1, len(feats)), dtype=float)
-
+        import shap  # import only when needed (after numpy shim)
+        # Use interventional perturbation + probability output; skip additivity checks
         expl = shap.TreeExplainer(
             model,
-            data=bg,                               # forces interventional path
             feature_perturbation="interventional",
             model_output="probability",
-            check_additivity=False,
+            check_additivity=False
         )
         return expl, None
     except Exception as e:
@@ -136,7 +138,7 @@ def get_cancel_explainer():
     with _shap_lock:
         if _explainer_cancel is None:
             print("[lazy] building SHAP explainer (cancel) …")
-            expl, _err = _build_tree_explainer(get_cancel_model(), "cancel")
+            expl, _ = _build_tree_explainer(get_cancel_model(), "cancel")
             _explainer_cancel = expl
     return _explainer_cancel
 
@@ -147,7 +149,7 @@ def get_delay_explainer():
     with _shap_lock:
         if _explainer_delay is None:
             print("[lazy] building SHAP explainer (delay) …")
-            expl, _err = _build_tree_explainer(get_delay_model(), "delay")
+            expl, _ = _build_tree_explainer(get_delay_model(), "delay")
             _explainer_delay = expl
     return _explainer_delay
 
@@ -175,13 +177,12 @@ app = FastAPI(
     description="Predict flight cancellation & delay risk with robust explanations (fallbacks if SHAP fails)."
 )
 
-# ---- CORS (allow browser clients) ----
+# CORS (so a web frontend can call your API)
+from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
 @app.get("/")
@@ -248,7 +249,7 @@ def predict_delay(f: FlightFeatures):
     proba = model.predict_proba(X)[0, 1]
     return {"delay_probability": float(proba), "predicted_label": int(proba >= 0.5)}
 
-# ----- SHAP (original endpoints, but never 500) -----
+# ----- SHAP (original endpoints; never 500—return structured errors) -----
 @app.post("/explain")
 def explain(f: FlightFeatures, topk: int = 8):
     model = get_cancel_model()
@@ -273,7 +274,6 @@ def explain(f: FlightFeatures, topk: int = 8):
             "top_contributions": top
         }
     except Exception as e:
-        # Do not 500: return a structured error
         return {"mode": "error", "error": f"{type(e).__name__}: {e}"}
 
 @app.post("/explain_delay")
@@ -302,7 +302,7 @@ def explain_delay(f: FlightFeatures, topk: int = 8):
     except Exception as e:
         return {"mode": "error", "error": f"{type(e).__name__}: {e}"}
 
-# ----- SAFE versions with fallback to feature_importances_ -----
+# ----- SAFE fallbacks (feature_importances_) -----
 def _fallback_importances(model, feats: List[str], Xrow: pd.Series, topk: int):
     if hasattr(model, "feature_importances_"):
         fi = np.asarray(model.feature_importances_, dtype=float)
@@ -315,16 +315,11 @@ def explain_safe(f: FlightFeatures, topk: int = 8):
     model = get_cancel_model()
     feats = get_cancel_features()
     X = _as_row(f.dict(), feats)
-
-    # try “safer” TreeExplainer path
     try:
         explainer = get_cancel_explainer()
         if explainer is not None:
             sv = explainer.shap_values(X)
-            if isinstance(sv, list):
-                shap_vals = sv[1][0]
-            else:
-                shap_vals = sv[0]
+            shap_vals = sv[1][0] if isinstance(sv, list) else sv[0]
             top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
             return {
                 "mode": "tree_shap",
@@ -332,9 +327,7 @@ def explain_safe(f: FlightFeatures, topk: int = 8):
                 "top_contributions": top
             }
     except Exception:
-        pass  # fall through to importances
-
-    # fallback to feature_importances
+        pass
     return _fallback_importances(model, feats, X.iloc[0], topk)
 
 @app.post("/explain_delay_safe")
@@ -342,15 +335,11 @@ def explain_delay_safe(f: FlightFeatures, topk: int = 8):
     model = get_delay_model()
     feats = get_delay_features()
     X = _as_row(f.dict(), feats)
-
     try:
         explainer = get_delay_explainer()
         if explainer is not None:
             sv = explainer.shap_values(X)
-            if isinstance(sv, list):
-                shap_vals = sv[1][0]
-            else:
-                shap_vals = sv[0]
+            shap_vals = sv[1][0] if isinstance(sv, list) else sv[0]
             top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
             return {
                 "mode": "tree_shap",
@@ -359,7 +348,6 @@ def explain_delay_safe(f: FlightFeatures, topk: int = 8):
             }
     except Exception:
         pass
-
     return _fallback_importances(model, feats, X.iloc[0], topk)
 
 # Background warmup
