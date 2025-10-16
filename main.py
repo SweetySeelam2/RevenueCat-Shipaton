@@ -1,24 +1,20 @@
 # main.py
-import os
-import threading
+import os, threading, concurrent.futures
 from typing import Optional, List, Dict, Any
-
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 import joblib
 
 # -------------------------
-# NumPy 2.x compatibility shim (for older libs like SHAP that reference np.bool / np.int / np.float)
+# NumPy 2.x compatibility shim (old libs may reference np.bool/np.int/np.float)
 # -------------------------
 try:
-    if not hasattr(np, "bool"):
-        np.bool = bool  # type: ignore[attr-defined]
-    if not hasattr(np, "int"):
-        np.int = int  # type: ignore[attr-defined]
-    if not hasattr(np, "float"):
-        np.float = float  # type: ignore[attr-defined]
+    if not hasattr(np, "bool"):  np.bool  = bool   # type: ignore[attr-defined]
+    if not hasattr(np, "int"):   np.int   = int    # type: ignore[attr-defined]
+    if not hasattr(np, "float"): np.float = float  # type: ignore[attr-defined]
 except Exception as _e:
     print(f"[startup] numpy shim warning: {_e}")
 
@@ -29,6 +25,7 @@ try:
 except Exception as e:
     print(f"[startup] ensure_models warning: {e}")
 
+# also try lazy import if still missing
 if not (os.path.exists("model/rf_cancel_model_fixed.pkl") and os.path.exists("model/rf_delay_model_fixed.pkl")):
     try:
         import fetch_models  # runs on import
@@ -41,13 +38,16 @@ MODEL_DELAY_PATH = os.getenv("MODEL_DELAY_PATH", "model/rf_delay_model_fixed.pkl
 CANCEL_FEATURE_ORDER_CSV = os.getenv("CANCEL_FEATURE_ORDER_CSV", "model/cancel_feature_order_fixed.csv")
 DELAY_FEATURE_ORDER_CSV = os.getenv("DELAY_FEATURE_ORDER_CSV", "model/delay_feature_order_fixed.csv")
 
+# SHAP toggles / timeouts
+DISABLE_SHAP = os.getenv("DISABLE_SHAP", "0") == "1"    # <-- set to 1 on Railway free
+SHAP_TIMEOUT_S = int(os.getenv("SHAP_TIMEOUT_S", "12")) # hard cap
+
 # ============== Globals / locks ==============
 _cancel_model = None
 _delay_model = None
 _cancel_features: List[str] = []
 _delay_features: List[str] = []
 
-# SHAP objects + last errors (so we can report instead of 500)
 _explainer_cancel = None
 _explainer_delay = None
 _shap_cancel_error: Optional[str] = None
@@ -56,6 +56,9 @@ _shap_delay_error: Optional[str] = None
 _features_lock = threading.Lock()
 _model_lock = threading.Lock()
 _shap_lock = threading.Lock()
+
+# small thread pool for SHAP calls (so we can enforce a timeout)
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def _file_exists(path: str) -> bool:
     try:
@@ -109,13 +112,9 @@ def get_delay_model():
     return _delay_model
 
 def _build_tree_explainer(model, which: str):
-    """
-    Build a TreeExplainer with safer settings (works better across versions).
-    """
     global _shap_cancel_error, _shap_delay_error
     try:
-        import shap  # import only when needed (after numpy shim)
-        # Use interventional perturbation + probability output; skip additivity checks
+        import shap  # import only after numpy shim
         expl = shap.TreeExplainer(
             model,
             feature_perturbation="interventional",
@@ -133,6 +132,8 @@ def _build_tree_explainer(model, which: str):
 
 def get_cancel_explainer():
     global _explainer_cancel
+    if DISABLE_SHAP:
+        return None
     if _explainer_cancel is not None:
         return _explainer_cancel
     with _shap_lock:
@@ -144,6 +145,8 @@ def get_cancel_explainer():
 
 def get_delay_explainer():
     global _explainer_delay
+    if DISABLE_SHAP:
+        return None
     if _explainer_delay is not None:
         return _explainer_delay
     with _shap_lock:
@@ -170,15 +173,25 @@ def _safe_topk_contrib(names: List[str], values: np.ndarray, Xrow: pd.Series, to
         })
     return out
 
+def _fallback_importances(model, feats: List[str], Xrow: pd.Series, topk: int):
+    if hasattr(model, "feature_importances_"):
+        fi = np.asarray(model.feature_importances_, dtype=float)
+        top = _safe_topk_contrib(feats, fi, Xrow, topk)
+        return {"mode": "feature_importances", "top_contributions": top}
+    return {"mode": "none", "reason": "no feature_importances_ on model"}
+
+def _shap_values_with_timeout(explainer, X):
+    # run SHAP in a worker so we can time out
+    future = _executor.submit(explainer.shap_values, X)
+    return future.result(timeout=SHAP_TIMEOUT_S)
+
 # ============== API ==============
 app = FastAPI(
     title="CancelSense API",
-    version="1.6.0",
-    description="Predict flight cancellation & delay risk with robust explanations (fallbacks if SHAP fails)."
+    version="1.7.0",
+    description="Predict cancellation & delay risk. SHAP can be disabled and is time-limited."
 )
 
-# CORS (so a web frontend can call your API)
-from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -201,17 +214,21 @@ def health():
         "delay_model_loaded": _delay_model is not None,
         "cancel_model_file_exists": _file_exists(MODEL_PATH),
         "delay_model_file_exists": _file_exists(MODEL_DELAY_PATH),
-        "shap_cancel_ready": _explainer_cancel is not None,
-        "shap_delay_ready": _explainer_delay is not None
+        "shap_cancel_ready": (not DISABLE_SHAP) and (_explainer_cancel is not None),
+        "shap_delay_ready":  (not DISABLE_SHAP) and (_explainer_delay is not None),
+        "shap_disabled": DISABLE_SHAP,
+        "shap_timeout_sec": SHAP_TIMEOUT_S
     }
 
 @app.get("/debug/shap_status")
 def shap_status():
     return {
-        "shap_cancel_ready": _explainer_cancel is not None,
-        "shap_delay_ready": _explainer_delay is not None,
+        "shap_cancel_ready": (not DISABLE_SHAP) and (_explainer_cancel is not None),
+        "shap_delay_ready":  (not DISABLE_SHAP) and (_explainer_delay is not None),
         "shap_cancel_error": _shap_cancel_error,
-        "shap_delay_error": _shap_delay_error
+        "shap_delay_error": _shap_delay_error,
+        "shap_disabled": DISABLE_SHAP,
+        "shap_timeout_sec": SHAP_TIMEOUT_S
     }
 
 # ----- schema -----
@@ -249,108 +266,62 @@ def predict_delay(f: FlightFeatures):
     proba = model.predict_proba(X)[0, 1]
     return {"delay_probability": float(proba), "predicted_label": int(proba >= 0.5)}
 
-# ----- SHAP (original endpoints; never 500—return structured errors) -----
+# ----- explanations -----
 @app.post("/explain")
 def explain(f: FlightFeatures, topk: int = 8):
     model = get_cancel_model()
     feats = get_cancel_features()
     X = _as_row(f.dict(), feats)
+
+    if DISABLE_SHAP:
+        return _fallback_importances(model, feats, X.iloc[0], topk)
+
     try:
         explainer = get_cancel_explainer()
         if explainer is None:
             raise RuntimeError(_shap_cancel_error or "SHAP explainer unavailable")
-        sv = explainer.shap_values(X)
+        sv = _shap_values_with_timeout(explainer, X)
         if isinstance(sv, list):
             shap_vals = sv[1][0]
-            base_value = float(explainer.expected_value[1])
+            base_value = float(getattr(explainer, "expected_value", [0.0, 0.0])[1])
         else:
             shap_vals = sv[0]
             base_value = float(getattr(explainer, "expected_value", 0.0))
         top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
-        return {
-            "mode": "tree_shap",
-            "base_value": base_value,
-            "cancel_probability": float(model.predict_proba(X)[0, 1]),
-            "top_contributions": top
-        }
+        return {"mode": "tree_shap", "base_value": base_value,
+                "cancel_probability": float(model.predict_proba(X)[0, 1]),
+                "top_contributions": top}
     except Exception as e:
-        return {"mode": "error", "error": f"{type(e).__name__}: {e}"}
+        return _fallback_importances(model, feats, X.iloc[0], topk) | {"fallback_reason": f"{type(e).__name__}: {e}"}
 
 @app.post("/explain_delay")
 def explain_delay(f: FlightFeatures, topk: int = 8):
     model = get_delay_model()
     feats = get_delay_features()
     X = _as_row(f.dict(), feats)
+
+    if DISABLE_SHAP:
+        return _fallback_importances(model, feats, X.iloc[0], topk)
+
     try:
         explainer = get_delay_explainer()
         if explainer is None:
             raise RuntimeError(_shap_delay_error or "SHAP explainer unavailable")
-        sv = explainer.shap_values(X)
+        sv = _shap_values_with_timeout(explainer, X)
         if isinstance(sv, list):
             shap_vals = sv[1][0]
-            base_value = float(explainer.expected_value[1])
+            base_value = float(getattr(explainer, "expected_value", [0.0, 0.0])[1])
         else:
             shap_vals = sv[0]
             base_value = float(getattr(explainer, "expected_value", 0.0))
         top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
-        return {
-            "mode": "tree_shap",
-            "base_value": base_value,
-            "delay_probability": float(model.predict_proba(X)[0, 1]),
-            "top_contributions": top
-        }
-    except Exception as e:
-        return {"mode": "error", "error": f"{type(e).__name__}: {e}"}
-
-# ----- SAFE fallbacks (feature_importances_) -----
-def _fallback_importances(model, feats: List[str], Xrow: pd.Series, topk: int):
-    if hasattr(model, "feature_importances_"):
-        fi = np.asarray(model.feature_importances_, dtype=float)
-        top = _safe_topk_contrib(feats, fi, Xrow, topk)
-        return {"mode": "feature_importances", "top_contributions": top}
-    return {"mode": "none", "reason": "no feature_importances_ on model"}
-
-@app.post("/explain_safe")
-def explain_safe(f: FlightFeatures, topk: int = 8):
-    model = get_cancel_model()
-    feats = get_cancel_features()
-    X = _as_row(f.dict(), feats)
-    try:
-        explainer = get_cancel_explainer()
-        if explainer is not None:
-            sv = explainer.shap_values(X)
-            shap_vals = sv[1][0] if isinstance(sv, list) else sv[0]
-            top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
-            return {
-                "mode": "tree_shap",
-                "cancel_probability": float(model.predict_proba(X)[0, 1]),
-                "top_contributions": top
-            }
-    except Exception:
-        pass
-    return _fallback_importances(model, feats, X.iloc[0], topk)
-
-@app.post("/explain_delay_safe")
-def explain_delay_safe(f: FlightFeatures, topk: int = 8):
-    model = get_delay_model()
-    feats = get_delay_features()
-    X = _as_row(f.dict(), feats)
-    try:
-        explainer = get_delay_explainer()
-        if explainer is not None:
-            sv = explainer.shap_values(X)
-            shap_vals = sv[1][0] if isinstance(sv, list) else sv[0]
-            top = _safe_topk_contrib(feats, shap_vals, X.iloc[0], topk)
-            return {
-                "mode": "tree_shap",
+        return {"mode": "tree_shap", "base_value": base_value,
                 "delay_probability": float(model.predict_proba(X)[0, 1]),
-                "top_contributions": top
-            }
-    except Exception:
-        pass
-    return _fallback_importances(model, feats, X.iloc[0], topk)
+                "top_contributions": top}
+    except Exception as e:
+        return _fallback_importances(model, feats, X.iloc[0], topk) | {"fallback_reason": f"{type(e).__name__}: {e}"}
 
-# Background warmup
+# Background warmup (models only; SHAP builds on-demand)
 def _background_warm():
     try:
         get_cancel_features()
