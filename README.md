@@ -1,6 +1,6 @@
 # ✈️ RevenueCat-Shipaton (CancelSense API)
 
-Predict **flight cancellation** and **delay probabilities** with explainable AI — powered by Random Forest models and served through a **FastAPI** backend on **Railway**.
+Predict **flight cancellation** and **delay probabilities** with explainable AI - powered by Random Forest models and served through a **FastAPI** backend on **Railway**.
 
 ---
 
@@ -62,7 +62,7 @@ Re-enable SHAP later by setting DISABLE_SHAP=0.
 
 ## 🧾 Example Requests
 
-PowerShell
+**PowerShell**
 ```
 $body = @'
 {
@@ -129,6 +129,7 @@ fetch("https://revenuecat-shipaton-production.up.railway.app/predict", {
 ```
 
 **Response Example**
+
 json
 ```
 {
@@ -163,7 +164,7 @@ json
 }
 ```
 
-If you re-enable SHAP (DISABLE_SHAP=0):
+**If you re-enable SHAP (DISABLE_SHAP=0):**
 
 json
 ```
@@ -179,12 +180,10 @@ json
 
 ## 🧩 OpenAPI Docs
 
-Interactive documentation:
-👉 https://revenuecat-shipaton-production.up.railway.app/docs
+Interactive documentation: https://revenuecat-shipaton-production.up.railway.app/docs
 
-🕓 Keep-Alive (Pinger Workflow)
-Prevent Railway from idling by adding this workflow at
-.github/workflows/ping.yml:
+🕓 Keep-Alive (Pinger Workflow)                                                                            
+Prevent Railway from idling by adding this workflow at .github/workflows/ping.yml:
 
 yaml
 ```
@@ -208,25 +207,26 @@ This pings the app every 10 minutes to keep it awake.
 ## 📦 Repository Structure
 css
 
-RevenueCat-Shipaton/
-├── README.md
-├── LICENSE
-├── Flight_Cancellation_Notification.ipynb
-├── .gitignore
-├── main.py                   ← FastAPI app entry point
-├── fetch_models.py           ← Downloads models from Hugging Face
-├── model/
-│   ├── rf_cancel_model_fixed.pkl
-│   ├── rf_delay_model_fixed.pkl
-│   ├── cancel_feature_order_fixed.csv
-│   └── delay_feature_order_fixed.csv
-├── requirements.txt
-└── .github/
+RevenueCat-Shipaton/                                                        
+├── README.md                                   
+├── LICENSE                                                     
+├── Flight_Cancellation_Notification.ipynb                                                          
+├── .gitignore                                                       
+├── main.py                  ← FastAPI app entry point                                                            
+├── fetch_models.py          ← Downloads models from Hugging Face                                                     
+├── model/                                                 
+│   ├── rf_cancel_model_fixed.pkl          ← Downloads models from Hugging Face                                            
+│   ├── rf_delay_model_fixed.pkl           ← Downloads models from Hugging Face                                                     
+│   ├── cancel_feature_order_fixed.csv                                                      
+│   └── delay_feature_order_fixed.csv                                                
+├── requirements.txt                                                                              
+└── .github/                                                                               
     └── workflows/ping.yml    ← keep-alive GitHub Action
 
 ---
 
 ## 🧭 Author
+
 **Sweety Seelam** - Business Analyst | Aspiring Data Scientist      
 
 📧 Email: sweetyseelam2@gmail.com
@@ -242,9 +242,13 @@ RevenueCat-Shipaton/
 ---
 
 **✅ Status:** Live and stable (200 OK on /predict & /predict_delay)
+
 **🧩 Backend:** FastAPI + Uvicorn
+
 **☁️ Hosting:** Railway (Python 3.11)
+
 **💾 Models:** Random Forest (Hugging Face PKL files)
+
 **🧠 Explainability:** SHAP (automatic fallback mode)
 
 ---
